@@ -127,6 +127,9 @@ class ModelSettingsRequest(BaseModel):
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
+    # MoE expert offload (stream non-resident experts from the checkpoint)
+    moe_expert_offload_enabled: bool | None = None
+    moe_expert_offload_resident_fraction: float | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -518,6 +521,8 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_kv_enabled"] = False
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
+    settings["moe_expert_offload_enabled"] = False
+    settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["specprefill_enabled"] = False
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
@@ -593,6 +598,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_kv_enabled = False
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
+    settings.moe_expert_offload_enabled = False
+    settings.moe_expert_offload_resident_fraction = 0.25
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -2275,6 +2282,15 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    # MoE expert offload settings
+    if "moe_expert_offload_enabled" in sent:
+        current_settings.moe_expert_offload_enabled = (
+            request.moe_expert_offload_enabled or False
+        )
+    if "moe_expert_offload_resident_fraction" in sent:
+        current_settings.moe_expert_offload_resident_fraction = (
+            request.moe_expert_offload_resident_fraction or 0.25
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

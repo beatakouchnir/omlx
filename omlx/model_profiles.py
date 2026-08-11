@@ -45,6 +45,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
     "turboquant_kv_bits",
     "turboquant_skip_last",
+    "moe_expert_offload_enabled",
+    "moe_expert_offload_resident_fraction",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",

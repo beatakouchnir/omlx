@@ -74,6 +74,8 @@ def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
     resolved = dict(data)
     resolved["vlm_mtp_enabled"] = False
     return resolved, conflicts
+
+
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
 
@@ -109,6 +111,11 @@ class ModelSettings:
         turboquant_kv_enabled: Enable TurboQuant KV cache compression.
         turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
+        moe_expert_offload_enabled: Stream MoE expert weights from the
+            checkpoint on demand instead of keeping them all resident (fits
+            models larger than memory; costs decode speed). Requires reload.
+        moe_expert_offload_resident_fraction: Fraction of each layer's experts
+            kept resident (0 < f <= 1, default 0.25).
         specprefill_enabled: Enable SpecPrefill (experimental sparse prefill for MoE).
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
@@ -198,6 +205,10 @@ class ModelSettings:
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
+
+    # MoE expert offload (stream non-resident experts from the checkpoint)
+    moe_expert_offload_enabled: bool = False
+    moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
@@ -321,6 +332,14 @@ class ModelSettings:
                     "require per-request logits processors, which the "
                     "vlm_mtp decode path does not apply"
                 )
+        # Expert offload streams from the checkpoint at a chosen residency;
+        # values outside (0, 1] have no meaning and would otherwise fail
+        # deep inside the load path instead of at the API boundary.
+        if not (0.0 < self.moe_expert_offload_resident_fraction <= 1.0):
+            raise ValueError(
+                "moe_expert_offload_resident_fraction must be in (0, 1], "
+                f"got {self.moe_expert_offload_resident_fraction}"
+            )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, excluding None values.

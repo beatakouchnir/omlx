@@ -337,6 +337,14 @@ class EnginePool:
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
+        moe_offload_active = bool(data.get("moe_expert_offload_enabled", False))
+        add("moe_expert_offload_enabled", moe_offload_active)
+        if moe_offload_active:
+            add(
+                "moe_expert_offload_resident_fraction",
+                data.get("moe_expert_offload_resident_fraction", 0.25),
+            )
+
         specprefill_active = bool(data.get("specprefill_enabled", False)) and has_value(
             "specprefill_draft_model"
         )

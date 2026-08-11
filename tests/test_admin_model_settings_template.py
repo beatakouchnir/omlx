@@ -52,3 +52,14 @@ def test_reasoning_effort_offers_max_after_high():
     assert high_option in html
     assert max_option in html
     assert html.index(high_option) < html.index(max_option)
+
+
+def test_moe_expert_offload_toggle_present_and_unmutexed():
+    """The offload toggle binds both fields and is never disabled by other
+    features — apply_moe_expert_offload degrades gracefully per layer, so
+    there is no UI mutex."""
+    html = _model_settings_template()
+    section = _section(html, "<!-- MoE Expert Offload -->", "<!-- IndexCache")
+    assert "modelSettings.moe_expert_offload_enabled" in section
+    assert "modelSettings.moe_expert_offload_resident_fraction" in section
+    assert ":disabled" not in section
