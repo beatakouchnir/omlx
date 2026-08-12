@@ -43,10 +43,8 @@ _N_LAYERS = 3
 _N_EXPERTS = 16
 
 
-@pytest.fixture
-def dsv4_model():
-    """Tiny DS4 model with quantized (affine 3-bit) switch projections."""
-    config = ModelArgs.from_dict(
+def _build_config():
+    return ModelArgs.from_dict(
         {
             "model_type": "deepseek_v4",
             "vocab_size": 64,
@@ -77,7 +75,12 @@ def dsv4_model():
             "dspark_markov_rank": 4,
         }
     )
-    model = DeepseekV4Model(config)
+
+
+@pytest.fixture
+def dsv4_model():
+    """Tiny DS4 model with quantized (affine 3-bit) switch projections."""
+    model = DeepseekV4Model(_build_config())
     for block in model.layers:
         smlp = block.ffn.switch_mlp
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -248,3 +251,54 @@ def test_pin_hot_survives_eviction(dsv4_model):
 
         still = pinned & set(cache.slot_of)
         assert still == pinned, f"pinned experts evicted: {pinned - still}"
+
+
+def test_mixed_bit_projections_offload_bit_exact():
+    """Per-projection quantization metadata (review item on #2595).
+
+    gate/up 3-bit affine + down 8-bit affine: the cache must carry each
+    projection's own (group, bits, mode) — reusing gate_proj's metadata
+    for the down projection crashes gather_qmm with a packed-shape
+    mismatch. Outputs stay bit-exact vs the resident twin.
+    """
+    import copy
+    import tempfile
+    from pathlib import Path
+
+    from mlx_lm.models.deepseek_v4 import DeepseekV4Model
+
+    from omlx.patches.moe_expert_offload import apply_moe_expert_offload
+
+    model = DeepseekV4Model(_build_config())
+    for block in model.layers:
+        smlp = block.ffn.switch_mlp
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            lin = getattr(smlp, proj)
+            if hasattr(lin, "to_quantized"):
+                bits = 8 if proj == "down_proj" else 3
+                setattr(
+                    smlp, proj,
+                    lin.to_quantized(group_size=32, bits=bits, mode="affine"),
+                )
+    twin = copy.deepcopy(model)
+    with tempfile.TemporaryDirectory() as tmp:
+        _dump_checkpoint(model, Path(tmp))
+        assert apply_moe_expert_offload(model, tmp, resident_fraction=0.25) > 0
+        cache = model.layers[0].ffn.switch_mlp.cache
+        assert cache.native_kind is None  # mixed formats -> gather_qmm
+        # metadata is per-projection
+        g3 = {p: cache.meta[p] for p in ("gate_proj", "up_proj")}
+        assert set(g3.values()) == {(32, 3, "affine")}, g3
+        assert cache.meta["down_proj"] == (32, 8, "affine")
+        # decode: bit-exact vs resident
+        x = mx.random.normal((1, 8, 64))
+        ids = mx.array([[3, 7, 11, 15, 2, 9, 5, 13]])
+        a = _moe_output(model.layers[0], x, ids)
+        b = _moe_output(twin.layers[0], x, ids)
+        assert np.array_equal(np.array(a), np.array(b))
+        # sorted prefill: bit-exact vs resident
+        xp = mx.random.normal((1, 64, 64))
+        ip = mx.random.randint(0, _N_EXPERTS, (1, 64))
+        a = _moe_output(model.layers[0], xp, ip)
+        b = _moe_output(twin.layers[0], xp, ip)
+        assert np.array_equal(np.array(a), np.array(b))

@@ -214,6 +214,13 @@ class ExpertCache:
                     else mx.zeros((self.capacity,) + b.shape[1:], dtype=b.dtype)
                 ),
             ]
+        self.meta: dict[str, tuple[int, int, str]] = {}
+        for name in self.projs:
+            lin = getattr(glu, name)
+            self.meta[name] = (lin.group_size, lin.bits, lin.mode)
+        # gate's metadata kept for back-compat; all reads go through
+        # self.meta[name] so mixed-bit projections (e.g. 3-bit gate/up with
+        # an 8-bit down) each get their own group/bits/mode.
         self.group = glu.gate_proj.group_size
         self.bits = glu.gate_proj.bits
         self.mode = glu.gate_proj.mode
@@ -352,6 +359,14 @@ class ExpertCache:
             from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
         except Exception:
             return None
+        # All projections must share the same qualifying (group, bits, mode):
+        # the block-list kernels dispatch a single format for the whole GLU,
+        # and the resident tensors must be uniformly packed. Mixed-bit GLUs
+        # (e.g. 3-bit gate/up with an 8-bit down) fall back to gather_qmm.
+        metas = [self.meta[name] for name in self.projs]
+        if len(set(metas)) != 1:
+            return None
+        g, b, m = metas[0]
         rw, rs, rb = self.resident["gate_proj"]
         if (
             # NOTE: the C++ binding hardcodes the envelope
@@ -362,9 +377,9 @@ class ExpertCache:
             # warm-cache-controlled A/B (a naive cold/warm comparison is
             # confounded by the expert-install cost). Keep the stock
             # envelope here; the generic extension is its own PR.
-            self.group == 64
-            and self.bits in (2, 3)
-            and self.mode == "affine"
+            g == 64
+            and b in (2, 3)
+            and m == "affine"
             and rb is not None
             and rw.dtype == mx.uint32
             and rs.dtype in (mx.float16, mx.bfloat16)
@@ -372,9 +387,9 @@ class ExpertCache:
         ):
             return "affine"
         if (
-            self.group == 32
-            and self.bits == 4
-            and self.mode == "mxfp4"
+            g == 32
+            and b == 4
+            and m == "mxfp4"
             and rw.dtype == mx.uint32
             and rs.dtype == mx.uint8
             and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_blocks")
@@ -400,12 +415,13 @@ class ExpertCache:
         from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
 
         rw, rs, rb = self.resident[name]
+        g, b, _ = self.meta[name]  # per-projection metadata (mixed-bit safe)
         if kind == "mxfp4":
             return glm_fast.deepseek_mxfp4_gather_qmm_blocks(
                 x, rw, rs, block_meta, block_count, block_variant
             )
         return glm_fast.deepseek_affine_gather_qmm_blocks(
-            x, rw, rs, rb, block_meta, block_count, self.group, self.bits,
+            x, rw, rs, rb, block_meta, block_count, g, b,
             block_variant,
         )
 
@@ -416,6 +432,7 @@ class ExpertCache:
         # stock SwitchGLU's sort decision so the kernel choice — and with it
         # the numerics — matches the path the resident model would take.
         rw, rs, rb = self.resident[name]
+        g, b, m = self.meta[name]  # per-projection metadata (mixed-bit safe)
         return mx.gather_qmm(
             x,
             rw,
@@ -423,9 +440,9 @@ class ExpertCache:
             rb,
             rhs_indices=slots,
             transpose=True,
-            group_size=self.group,
-            bits=self.bits,
-            mode=self.mode,
+            group_size=g,
+            bits=b,
+            mode=m,
             sorted_indices=sorted_indices,
         )
 
