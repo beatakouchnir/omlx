@@ -135,10 +135,36 @@ cold reads from the internal SSD of an M5 Max, 12.5% residency:
 | sorted prefill, 256 tokens | 33 token-layers/s | 568 token-layers/s |
 
 These are single runs of adapter-level calls on synthetic weights; they
-exclude attention, Engram, and the rest of the forward. The per-token decode cost
-of the offload path is the sum over the 40 MoE layers, so at 12.5%
-residency expect the expert reads alone to take roughly 0.35 s per token
-on this SSD, with fewer misses at higher residency.
+exclude attention, Engram, and the rest of the forward.
+
+### Measured on a 128 GB Mac
+
+`Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp` on an M5 Max with 128 GB and the
+internal SSD (`iogpu.wired_limit_mb` unset), Engram on SSD, native kernels
+built, run with `benchmarks/deepseek_v41_offload_bench.py` on a 433-token
+prose prompt in one prefill chunk followed by 64 greedy tokens. Single runs:
+
+| residency | experts per layer | load | Metal active | peak footprint | prefill | decode | decode hit rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 12.5% | 48 | 3.9 s | 38.0 GiB | 49.6 GiB | 28 tok/s | 5.6 tok/s | 0.69 |
+| 25% | 96 | 4.5 s | 65.7 GiB | 77.4 GiB | 25 tok/s | 4.2 tok/s | 0.78 |
+
+Both settings produce coherent, on-topic continuations. Served through
+`omlx serve` with the same settings (discovered from the HF cache, Engram
+forced to SSD by admission, 12.5% residency, engine load 4.4 s), two
+64-token chat completions ran at 2.7 tok/s on cold expert slots and
+4.1 tok/s after. Prefill reads every
+expert the prompt routes to once per layer (about 226 of 384 per layer for
+this prompt, 130 GiB in total) at 8 to 9 GB/s. Decode is bound by miss
+latency at one to two misses per layer per token. The lower residency
+decodes faster: the RAM the resident slots do not take is used by the page
+cache, which serves repeated misses far faster than the SSD (6.5 GB/s
+effective at 12.5% against 3.4 GB/s at 25%). On a 128 GB machine 12.5% is
+the better default. Expect the page cache to take all remaining RAM during
+a run; it is reclaimable and is not part of the Metal working-set limit.
+Higher residencies fit the limit on paper (`fit_resident_fraction` reports
+41% at 107.5 GiB) but leave no headroom for the KV cache and prefill
+transients, and were not measured.
 
 ### Sizing on a 128 GB Mac
 
