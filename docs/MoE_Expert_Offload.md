@@ -113,6 +113,33 @@ to the routed experts in each backbone layer, with capacity floored at the
 number selected by one token. Shared experts, attention, and other backbone
 weights remain resident.
 
+Non-resident experts are read with positional `pread` calls on a small
+reader pool of their own, not through the Engram row-gather mapping: an
+expert is megabytes of contiguous bytes, and a faulting `MADV_RANDOM` gather
+reads it one page at a time. A residency update starts the misses' reads
+ahead of the installs, at most 512 MiB of payload in flight, and installs
+them serially in the order the misses were seen, so eviction victims, hit
+and miss counts, and resident bytes are identical to a serial fetch. Sorted
+prefill routes are chunked on expert boundaries (every route of up to
+`capacity` distinct experts per chunk), so a prefill reads each expert once
+per layer and runs one kernel per chunk.
+
+Measured on a synthetic checkpoint with the oQ3e expert geometry (384
+experts, 3-bit affine, 14.8 MiB per expert, 4 layers, random weights),
+cold reads from the internal SSD of an M5 Max, 12.5% residency:
+
+| | mmap gather (before) | positional reads |
+|---|---:|---:|
+| decode, one token, per MoE layer | 362 ms | 9.1 ms |
+| expert fetch throughput | 0.23 GB/s | 9.3 GB/s |
+| sorted prefill, 256 tokens | 33 token-layers/s | 568 token-layers/s |
+
+These are single runs of adapter-level calls on synthetic weights; they
+exclude attention, Engram, and the rest of the forward. The per-token decode cost
+of the offload path is the sum over the 40 MoE layers, so at 12.5%
+residency expect the expert reads alone to take roughly 0.35 s per token
+on this SSD, with fewer misses at higher residency.
+
 For a 384-expert checkpoint, 12.5% keeps 48 experts per layer. The adapter
 preserves V4.1's activation quantization, clamped SwiGLU, and application of
 routing weights before the down projection. Large routed batches are split
