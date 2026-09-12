@@ -140,6 +140,28 @@ of the offload path is the sum over the 40 MoE layers, so at 12.5%
 residency expect the expert reads alone to take roughly 0.35 s per token
 on this SSD, with fewer misses at higher residency.
 
+### Sizing on a 128 GB Mac
+
+For `Jundot/DeepSeek-V4.1-Flash-oQ3e-mtp`, the shard headers give 221.5 GiB
+of routed experts, 91.9 GiB of Engram tables, 7.5 GiB of DSpark draft
+weights (not loaded under offload), and 10.1 GiB of everything else. With
+Engram on SSD the resident set is:
+
+| resident fraction | experts per layer | resident weights |
+|---:|---:|---:|
+| 12.5% | 48 | 38 GiB |
+| 25% | 96 | 65 GiB |
+| 33.3% | 128 | 84 GiB |
+| 37.5% | 144 | 93 GiB |
+
+The Metal working-set limit on a 128 GB machine with `iogpu.wired_limit_mb`
+unset is about 107 GiB, and KV cache, prefill transients, and the Engram
+page cache share it. `admission_bytes(path, fraction)` and
+`fit_resident_fraction(path, budget_bytes)` in
+`omlx.patches.deepseek_v41.moe_offload` give the engine pool's admission
+estimate for a fraction and the largest fraction whose estimate fits a byte
+budget.
+
 For a 384-expert checkpoint, 12.5% keeps 48 experts per layer. The adapter
 preserves V4.1's activation quantization, clamped SwiGLU, and application of
 routing weights before the down projection. Large routed batches are split

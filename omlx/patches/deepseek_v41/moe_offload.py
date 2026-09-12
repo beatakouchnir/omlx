@@ -27,7 +27,11 @@ import numpy as np
 
 from .convert import repack_weight
 from .quantization import QuantizedProjection
-from .residency import checkpoint_signature, header_with_offset
+from .residency import (
+    checkpoint_signature,
+    deepseek_v41_residency_estimate,
+    header_with_offset,
+)
 from .storage import SAFETENSORS_NUMPY_DTYPES, decode_array
 
 _PROJECTIONS = ("w1", "w3", "w2")
@@ -511,3 +515,69 @@ def _estimate_expert_savings(path, fraction, signature):
     plan = _plan(path, fraction)
     # Keep the existing residency estimator's 5% nonexpert safety allowance.
     return plan.full_bytes - plan.resident_bytes + plan.draft_bytes
+
+
+def _admission(plan, capacity, estimate, engram_ssd_offload, file_bytes):
+    """``EnginePool._entry_runtime_resident_size`` for one expert capacity.
+
+    With Engram tables: the header residency estimate for the selected
+    Engram mode, less 1.05 times the expert savings. Without them the pool
+    has no residency estimate and discounts the savings from the discovery
+    size (shard file sizes with a 5% allowance) instead.
+    """
+    saved = plan.full_bytes - plan.resident_bytes_at(capacity) + plan.draft_bytes
+    if estimate.supported:
+        base = estimate.mmap_bytes if engram_ssd_offload else estimate.resident_bytes
+        return max(0, base - int(saved * 1.05))
+    return max(0, file_bytes() - saved)
+
+
+def _file_bytes(path):
+    from ...model_discovery import estimate_model_size
+
+    return lambda: estimate_model_size(Path(path))
+
+
+def admission_bytes(path, fraction, *, engram_ssd_offload=True):
+    """The engine pool's admission estimate for expert offload at ``fraction``."""
+    return _admission_bytes(
+        str(path), float(fraction), bool(engram_ssd_offload), checkpoint_signature(path)
+    )
+
+
+@lru_cache(maxsize=32)
+def _admission_bytes(path, fraction, engram_ssd_offload, signature):
+    plan = _plan(path, fraction)
+    estimate = deepseek_v41_residency_estimate(path)
+    return _admission(
+        plan, plan.capacity, estimate, engram_ssd_offload, _file_bytes(path)
+    )
+
+
+def fit_resident_fraction(path, budget_bytes, *, engram_ssd_offload=True):
+    """Largest resident fraction whose admission estimate fits ``budget_bytes``.
+
+    Returns ``None`` when even the routing floor does not fit. The result is
+    a whole number of experts per layer expressed as a fraction, so passing
+    it back as the setting reproduces the same capacity.
+    """
+    return _fit_resident_fraction(
+        str(path),
+        int(budget_bytes),
+        bool(engram_ssd_offload),
+        checkpoint_signature(path),
+    )
+
+
+@lru_cache(maxsize=32)
+def _fit_resident_fraction(path, budget_bytes, engram_ssd_offload, signature):
+    plan = _plan(path, 1.0)
+    estimate = deepseek_v41_residency_estimate(path)
+    file_bytes = _file_bytes(path)
+    for capacity in range(plan.count, plan.floor - 1, -1):
+        if (
+            _admission(plan, capacity, estimate, engram_ssd_offload, file_bytes)
+            <= budget_bytes
+        ):
+            return capacity / plan.count
+    return None

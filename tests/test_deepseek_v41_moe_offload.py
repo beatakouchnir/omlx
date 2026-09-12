@@ -482,3 +482,58 @@ def test_sorted_routes_chunk_on_expert_boundaries(tmp_path, monkeypatch):
         assert disk.slots.misses == 16 and disk.slots.hits == 0
     finally:
         plan.close()
+
+
+@pytest.mark.parametrize("engram", [False, True])
+def test_admission_and_fit_match_the_engine_pool(tmp_path, engram):
+    from test_engine_pool import _make_pool
+
+    from omlx.engine_pool import EngineEntry
+    from omlx.model_discovery import estimate_model_size
+    from omlx.model_settings import ModelSettings
+    from omlx.patches.deepseek_v41.moe_offload import (
+        admission_bytes,
+        fit_resident_fraction,
+    )
+
+    kwargs = dict(n_routed_experts=8, n_activated_experts=2)
+    if engram:
+        kwargs.update(
+            engram_layer_ids=(1, 3),
+            engram_num_embeddings=(72, 204),
+            engram_vocab_size=5,
+            engram_max_ngram_size=4,
+            engram_n_heads=2,
+            engram_head_dim=32,
+            engram_compressed_vocab_size=64,
+        )
+    source, _ = write_checkpoint(tmp_path, vision=False, **kwargs)
+    target = tmp_path / "converted"
+    convert(source, target)
+    pool = _make_pool(ceiling=1024**3)
+    entry = EngineEntry(
+        model_id="v41",
+        model_path=str(target),
+        model_type="vlm",
+        engine_type="vlm",
+        config_model_type="deepseek_v41",
+        estimated_size=estimate_model_size(target),
+    )
+    assert fit_resident_fraction(target, 1 << 60, engram_ssd_offload=engram) == 1.0
+    assert fit_resident_fraction(target, 0, engram_ssd_offload=engram) is None
+    for capacity in range(2, 9):
+        fraction = capacity / 8
+        settings = ModelSettings(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=fraction,
+            deepseek_v41_engram_ssd_offload=engram,
+        )
+        expected = pool._entry_runtime_resident_size(entry, settings)
+        assert expected > 0
+        assert admission_bytes(target, fraction, engram_ssd_offload=engram) == expected
+        assert fit_resident_fraction(target, expected, engram_ssd_offload=engram) == (
+            fraction
+        )
+        assert fit_resident_fraction(
+            target, expected - 1, engram_ssd_offload=engram
+        ) == ((capacity - 1) / 8 if capacity > 2 else None)
