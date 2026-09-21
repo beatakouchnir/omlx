@@ -17,8 +17,10 @@ choice inside it (sort threshold, weighted sum, inverse scatter) is a
 function of the routes and the slot tensors' shapes, and every use of an
 index is a gather, so a route computes the same numbers against its slot
 as it would against its expert. A miss reads the expert's gate, up and down
-slabs from the checkpoint's own safetensors (the split layout the
-checkpoints ship) and writes the two halves of the fused row in place.
+slabs through the common checkpoint store (positional reads on its shared
+pool) from either layout a checkpoint may ship, stacked ``[E, ...]`` tensors
+or one tensor per expert (which the loader stacks), and writes the two
+halves of the fused row in place.
 
 Over-capacity prefill, where one call routes to more distinct experts than
 the cache holds, is chunked on expert boundaries exactly as the common
@@ -30,13 +32,10 @@ reassembled routes the way the model does when the kernel is unavailable.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
-from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 from pathlib import Path
-from threading import Lock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -47,6 +46,8 @@ from ..moe_expert_offload import (
     _DTYPES,
     CheckpointExpertStore,
     _GLUStoreView,
+    _io_batch,
+    _io_pool,
     _minimum_experts,
     _resolve_model_dir,
 )
@@ -57,19 +58,15 @@ logger = logging.getLogger(__name__)
 # checkpoint projections, in the order the fused row concatenates them
 _SOURCES = ("gate_proj", "up_proj", "down_proj")
 
-# Misses are read with positional reads on a small pool, the DeepSeek V4.1
-# adapter's shape: the common store's memmap path faults a 20 MiB expert in
-# 16 KiB pages on the compute thread, which measured 0.4 GB/s on the GLM-5.2
-# checkpoint against the 8 GB/s and more a positional read of the whole slab
-# gets from the same drive. At most INFLIGHT_BYTES of payload sit ahead of
+# Misses are positional reads through the common store on its shared pool
+# (``OMLX_MOE_OFFLOAD_IO_WORKERS`` / ``OMLX_MOE_OFFLOAD_IO_BATCH``), the
+# DeepSeek V4.1 adapter's shape: the store's memmap path faults a 20 MiB
+# expert in 16 KiB pages on the compute thread, which measured 0.4 GB/s on
+# the GLM-5.2 checkpoint against the 8 GB/s and more a positional read of the
+# whole slab gets from the same drive. GLM experts are large, so on top of the
+# pool's expert-count window at most INFLIGHT_BYTES of payload sit ahead of
 # the slot writes.
 INFLIGHT_BYTES = 512 * 1024 * 1024
-EXPERT_IO_WORKERS = 24
-_EXPERT_IO_POOL = ThreadPoolExecutor(
-    max_workers=EXPERT_IO_WORKERS, thread_name_prefix="glm-expert-io"
-)
-
-Slab = namedtuple("Slab", "name fd offset nbytes np_dtype mx_view shape")
 
 
 def is_glm_switch_glu(obj) -> bool:
@@ -104,8 +101,12 @@ def resolve_view(glu, store: CheckpointExpertStore, path: str):
     """Validate the checkpoint against the module; ``(view, None)`` or ``(None, reason)``.
 
     The checkpoint must hold the split ``gate_proj``/``up_proj``/``down_proj``
-    stacked under the module's tree path with shapes the module's (possibly
-    fused) projections are built from, in a storage dtype the store can read.
+    with shapes the module's (possibly fused) projections are built from, in
+    a storage dtype the store can read, in either layout: stacked under the
+    module's tree path, or one tensor per expert under its parent
+    (``<parent>.experts.<e>.<proj>.<field>``, which the loader stacks). The
+    per-expert layout is verified expert by expert, as the common adapter
+    does, so a checkpoint missing one expert is skipped rather than read.
     """
     layout = _layout(glu)
     for lin_name, _ in layout:
@@ -114,85 +115,41 @@ def resolve_view(glu, store: CheckpointExpertStore, path: str):
             return None, f"{lin_name} is not a QuantizedSwitchLinear"
         if "bias" in lin:
             return None, f"{lin_name} has per-expert bias (unsupported)"
-    view = _GLUStoreView(store, path)
+    n_experts = glu[layout[0][0]]["weight"].shape[0]
+    stacked = _GLUStoreView(store, path)
+    parent = path.rsplit(".", 1)[0] if "." in path else ""
+    view = (
+        stacked
+        if stacked.has("gate_proj", "weight")
+        else _GLUStoreView(store, parent, per_expert=True)
+    )
     for lin_name, sources in layout:
         lin = glu[lin_name]
         for field in _fields(lin):
             module_shape = tuple(lin[field].shape)
+            if module_shape[1] % len(sources):
+                return None, f"{lin_name}.{field} rows do not split into {sources}"
             want = (
                 module_shape[0],
                 module_shape[1] // len(sources),
                 *module_shape[2:],
             )
-            if module_shape[1] % len(sources):
-                return None, f"{lin_name}.{field} rows do not split into {sources}"
             for src in sources:
-                name = view._name(src, field, 0)
-                if not store.has(name):
-                    return None, f"checkpoint has no tensor {name!r}"
-                shape, dtype = store.spec(name)
-                if shape != want:
-                    return None, f"{name!r} shape {shape} != expected {want}"
-                if dtype not in _DTYPES:
-                    return None, f"{name!r} has unsupported dtype {dtype!r}"
+                if view is stacked:
+                    checks = [(view._name(src, field, 0), want)]
+                else:
+                    checks = [
+                        (view._name(src, field, e), want[1:]) for e in range(n_experts)
+                    ]
+                for name, want_shape in checks:
+                    if not store.has(name):
+                        return None, f"checkpoint has no tensor {name!r}"
+                    shape, dtype = store.spec(name)
+                    if shape != want_shape:
+                        return None, f"{name!r} shape {shape} != expected {want_shape}"
+                    if dtype not in _DTYPES:
+                        return None, f"{name!r} has unsupported dtype {dtype!r}"
     return view, None
-
-
-class _SlabReader:
-    """Positional reads of one expert's slabs from the stacked checkpoint."""
-
-    def __init__(self, store: CheckpointExpertStore, prefix: str):
-        self._store = store
-        self._prefix = prefix
-        self._fds: dict[Path, int] = {}
-        self._lock = Lock()
-
-    def _fd(self, shard: Path) -> int:
-        with self._lock:
-            fd = self._fds.get(shard)
-            if fd is None:
-                fd = self._fds[shard] = os.open(shard, os.O_RDONLY)
-            return fd
-
-    def plan(self, proj: str, field: str, expert: int) -> Slab:
-        name = f"{self._prefix}.{proj}.{field}"
-        shard, dtype, shape, offset = self._store._specs[name]
-        np_dtype, mx_view = _DTYPES[dtype]
-        nbytes = int(np.prod(shape[1:])) * np.dtype(np_dtype).itemsize
-        return Slab(
-            name,
-            self._fd(shard),
-            offset + expert * nbytes,
-            nbytes,
-            np_dtype,
-            mx_view,
-            tuple(shape[1:]),
-        )
-
-    @staticmethod
-    def read(slab: Slab) -> bytearray:
-        """The slab's bytes; positional reads only, so any thread may call it."""
-        buffer = bytearray(slab.nbytes)
-        view = memoryview(buffer)
-        done = 0
-        while done < slab.nbytes:
-            count = os.preadv(slab.fd, [view[done:]], slab.offset + done)
-            if count <= 0:
-                raise ValueError(f"Truncated tensor data: {slab.name}")
-            done += count
-        return buffer
-
-    @staticmethod
-    def to_array(slab: Slab, raw: bytearray) -> mx.array:
-        out = mx.array(np.frombuffer(raw, dtype=slab.np_dtype).reshape(slab.shape))
-        return out.view(slab.mx_view) if slab.mx_view is not None else out
-
-    def close(self) -> None:
-        with self._lock:
-            fds, self._fds = self._fds, {}
-        for fd in fds.values():
-            with contextlib.suppress(OSError):
-                os.close(fd)
 
 
 class _SlotCache:
@@ -222,7 +179,6 @@ class _SlotCache:
         self.hits = self.misses = 0
         self.fetched_bytes = 0
         self.warm = False
-        self.reader = _SlabReader(view._store, view._prefix)
         # (module projection, field, row offset, row count, checkpoint slab)
         # for one expert, in slot-write order; the byte total sizes the window.
         self._writes: list[tuple[str, str, int, int, str]] = []
@@ -233,8 +189,7 @@ class _SlotCache:
                 for j, src in enumerate(sources):
                     self._writes.append((lin_name, field, j * rows, rows, src))
         self.expert_bytes = sum(
-            self.reader.plan(src, field, 0).nbytes
-            for _, field, _, _, src in self._writes
+            view.plan(src, field, 0).nbytes for _, field, _, _, src in self._writes
         )
 
     def ensure(self, idx: mx.array) -> None:
@@ -247,11 +202,12 @@ class _SlotCache:
 
         Two passes, as in the V4.1 adapter: hits are touched first so the
         whole working set is protected from eviction, then the misses' reads
-        start on the pool, at most ``INFLIGHT_BYTES`` ahead of the serial
-        installs, which write slots in the order the misses were seen so
-        victims and counters match a serial fetch. A failed read leaves
-        completed installs intact, and every read this call started is
-        drained before it raises.
+        start on the shared pool, at most the pool's window and
+        ``INFLIGHT_BYTES`` ahead of the serial installs, which write slots in
+        the order the misses were seen so victims and counters match a serial
+        fetch. Without a pool (``OMLX_MOE_OFFLOAD_IO_WORKERS`` <= 1) each miss
+        is read inline. A failed read leaves completed installs intact, and
+        every read this call started is drained before it raises.
         """
         needed = list(dict.fromkeys(int(e) for e in ids))
         misses = []
@@ -264,9 +220,17 @@ class _SlotCache:
         if not misses:
             return
         protected = set(needed)
+        pool = _io_pool()
+        window = 0
+        if pool is not None:
+            window = max(1, min(_io_batch(), INFLIGHT_BYTES // max(1, self.expert_bytes)))
         pending: dict[int, list] = {}
-        window = max(1, INFLIGHT_BYTES // max(1, self.expert_bytes))
         submitted = 0
+
+        def plans(e):
+            return [
+                (write, self.view.plan(write[4], write[1], e)) for write in self._writes
+            ]
 
         def submit(limit):
             nonlocal submitted
@@ -274,9 +238,8 @@ class _SlotCache:
                 e = misses[submitted]
                 submitted += 1
                 pending[e] = [
-                    (write, slab, _EXPERT_IO_POOL.submit(_SlabReader.read, slab))
-                    for write in self._writes
-                    for slab in (self.reader.plan(write[4], write[1], e),)
+                    (write, plan, pool.submit(CheckpointExpertStore.read, plan))
+                    for write, plan in plans(e)
                 ]
 
         try:
@@ -285,16 +248,22 @@ class _SlotCache:
                 # Refill before this expert's writes so at most ``window``
                 # experts' bytes exist at once, counting the one written here.
                 submit(done + window)
-                raws = [(write, slab, f.result()) for write, slab, f in pending[e]]
+                if e in pending:
+                    raws = [(write, plan, f.result()) for write, plan, f in pending[e]]
+                else:
+                    raws = [
+                        (write, plan, CheckpointExpertStore.read(plan))
+                        for write, plan in plans(e)
+                    ]
                 if self.free:
                     slot = self.free.pop()
                 else:
                     victim = next(v for v in self.slot_of if v not in protected)
                     slot = self.slot_of.pop(victim)
                     self.map[victim] = -1
-                for (lin_name, field, row0, rows, _), slab, raw in raws:
+                for (lin_name, field, row0, rows, _), plan, raw in raws:
                     target = self.glu[lin_name][field]
-                    array = _SlabReader.to_array(slab, raw)
+                    array = CheckpointExpertStore.to_mx(plan, raw)
                     if row0 == 0 and rows == target.shape[1]:
                         target[slot] = array
                     else:
@@ -302,13 +271,15 @@ class _SlotCache:
                 self.slot_of[e] = slot
                 self.map[e] = slot
                 self.misses += 1
-                self.fetched_bytes += sum(slab.nbytes for _, slab, _ in raws)
-                del pending[e], raws
+                self.fetched_bytes += sum(plan.nbytes for _, plan, _ in raws)
+                pending.pop(e, None)
+                del raws
         finally:
-            for group in pending.values():
-                for _, _, f in group:
-                    if not f.cancel():
-                        f.exception()
+            futures = [f for group in pending.values() for _, _, f in group]
+            for future in futures:
+                future.cancel()
+            if futures:
+                wait(futures)
         self.warm = len(self.slot_of) == self.n_experts
 
 

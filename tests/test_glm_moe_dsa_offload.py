@@ -54,11 +54,20 @@ def _make_pair(seed=0, e=E, d=D, inter=INTER, group=GROUP):
     return split, fused
 
 
-def _tensors(split, prefix=PREFIX):
+def _tensors(split, prefix=PREFIX, per_expert=False):
+    """The split projections as a checkpoint ships them: stacked under the
+    module's path, or one tensor per expert under its parent (the layout the
+    loader stacks at load, so the stacked names never exist in the file)."""
     out = {}
+    parent = prefix.rsplit(".", 1)[0]
     for proj in ("gate_proj", "up_proj", "down_proj"):
         for field in ("weight", "scales", "biases"):
-            out[f"{prefix}.{proj}.{field}"] = getattr(split, proj)[field]
+            tensor = getattr(split, proj)[field]
+            if per_expert:
+                for e in range(tensor.shape[0]):
+                    out[f"{parent}.experts.{e}.{proj}.{field}"] = tensor[e]
+            else:
+                out[f"{prefix}.{proj}.{field}"] = tensor
     return out
 
 
@@ -145,11 +154,15 @@ def kernels(request, monkeypatch):
     return request.param
 
 
-@pytest.fixture(params=["fused", "split"])
+@pytest.fixture(
+    params=["fused-stacked", "split-stacked", "fused-per-expert", "split-per-expert"]
+)
 def reference(request, tmp_path):
+    """The module fused or split, over a checkpoint stacked or per expert."""
+    module, layout = request.param.split("-", 1)
     split, fused = _make_pair()
-    _write(tmp_path, _tensors(split))
-    return fused if request.param == "fused" else split
+    _write(tmp_path, _tensors(split, per_expert=layout == "per-expert"))
+    return fused if module == "fused" else split
 
 
 def test_wrap_replaces_module_and_keeps_only_slots(tmp_path, reference):
@@ -290,3 +303,26 @@ def test_admission_estimate_counts_glm_experts(tmp_path):
     assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full - int(
         expert_bytes * 0.75
     )
+
+
+def test_wrap_and_release_return_descriptors_to_baseline(tmp_path, reference):
+    """The store owns the shard descriptors: repeated wrap, fetch and release
+    cycles must not accumulate open files (a private reader once did)."""
+    import gc
+    import os
+
+    def open_fds():
+        return len(os.listdir("/dev/fd"))
+
+    def cycle():
+        wrapped = _wrapped(tmp_path, reference, 0.25)
+        wrapped(_x(4, D), _routes((4, K)))  # misses read through the store
+        return wrapped
+
+    cycle()  # settle one-time allocations (pools, lazy imports)
+    gc.collect()
+    baseline = open_fds()
+    for _ in range(10):
+        cycle()
+        gc.collect()
+    assert open_fds() == baseline

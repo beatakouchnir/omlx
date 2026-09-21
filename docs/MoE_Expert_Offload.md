@@ -257,8 +257,9 @@ resident module for decode, for sorted prefill through the native weighted
 sum, and for sorted calls that fit the cache, and a rounding-scale bound for
 over-capacity prefill, which is chunked on expert boundaries like the other
 adapters. A miss reads the expert's split `gate_proj`, `up_proj` and
-`down_proj` slabs from the checkpoint (the layout the checkpoints ship) and
-writes the two halves of the fused row in place.
+`down_proj` slabs from the checkpoint, stacked or one tensor per expert (the
+layout the loader stacks at load), and writes the two halves of the fused
+row in place.
 
 Sizing, from the shard headers of `mlx-community/GLM-5.2-4bit` (409 GiB
 estimated, about 5.2 GiB of routed experts per layer, 20 MiB per expert):
@@ -286,8 +287,8 @@ per token is 4.2 GiB, which the positional reads move at about 8 GiB/s. The
 same 20% configuration fetching through the common store's memmap path
 measured 646 s to first token and 0.09 tok/s, because a slab faulted in
 16 KiB pages on the compute thread reads at 0.4 GB/s; that is why this
-adapter reads misses with positional reads on a pool, as the V4.1 adapter
-does. Continuations were coherent and identical between the cold and warm
+adapter reads misses through the store's positional reads on the shared
+reader pool, as the V4.1 adapter does. Continuations were coherent and identical between the cold and warm
 runs at each residency; between residencies the two texts forked at one
 marginal token (a capitalization), which is the documented behavior of
 over-capacity prefill under a different chunking.

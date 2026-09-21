@@ -207,6 +207,109 @@ def test_admin_uses_adjusted_residency_for_offload_models(tmp_path, kind):
     assert model[prefix + "_resident_bytes"] == 450
 
 
+@pytest.mark.parametrize("layout", ["stacked", "per_expert"])
+def test_glm_loader_paths_match_offload_admission(tmp_path, layout):
+    """Through the real GLM loader, eligibility, the adapter's reads and the
+    admission estimate agree for both checkpoint layouts: every MoE layer
+    is wrapped, the output is unchanged, and the estimate discounts exactly
+    the experts the wrapper leaves on disk."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import load_model
+
+    from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
+    from omlx.patches.moe_expert_offload import (
+        apply_moe_expert_offload,
+        estimate_offload_admission_bytes,
+    )
+
+    apply_glm_moe_dsa_patch()
+    from mlx_lm.models import glm_moe_dsa
+
+    config = dict(
+        model_type="glm_moe_dsa",
+        vocab_size=1024,
+        hidden_size=128,
+        index_head_dim=16,
+        index_n_heads=4,
+        index_topk=4,
+        intermediate_size=256,
+        moe_intermediate_size=256,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        n_shared_experts=1,
+        n_routed_experts=16,
+        routed_scaling_factor=2.5,
+        kv_lora_rank=16,
+        q_lora_rank=24,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        qk_nope_head_dim=16,
+        topk_method="noaux_tc",
+        scoring_func="sigmoid",
+        norm_topk_prob=True,
+        n_group=2,
+        topk_group=1,
+        num_experts_per_tok=2,
+        moe_layer_freq=1,
+        first_k_dense_replace=1,
+        max_position_embeddings=1024,
+        rms_norm_eps=1e-5,
+        rope_parameters={"rope_theta": 10000.0},
+        attention_bias=False,
+        index_topk_pattern="FSF",
+    )
+    model = glm_moe_dsa.Model(glm_moe_dsa.ModelArgs.from_dict(config))
+    # The tiny MLA ranks are narrower than a group; the loader likewise
+    # quantizes only the layers whose scales the checkpoint carries.
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda _, m: hasattr(m, "to_quantized")
+        and m.weight.shape[-1] % 32 == 0,
+    )
+    weights = dict(tree_flatten(model.parameters()))
+    expert_bytes = sum(v.nbytes for k, v in weights.items() if ".switch_mlp." in k)
+    # As shipped: split gate/up projections, stacked or one tensor per expert.
+    shipped = {}
+    for key, value in weights.items():
+        if ".switch_mlp.gate_up_proj." in key:
+            gate, up = mx.split(value, 2, axis=value.ndim - 2)
+            shipped[key.replace("gate_up_proj", "gate_proj")] = gate
+            shipped[key.replace("gate_up_proj", "up_proj")] = up
+        else:
+            shipped[key] = value
+    if layout == "per_expert":
+        stacked = {k: v for k, v in shipped.items() if ".switch_mlp." in k}
+        for key, value in stacked.items():
+            del shipped[key]
+            parent, rest = key.split(".switch_mlp.")
+            for e in range(value.shape[0]):
+                shipped[f"{parent}.experts.{e}.{rest}"] = value[e]
+    config["quantization"] = {"group_size": 32, "bits": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    checkpoint = tmp_path / "model.safetensors"
+    mx.save_safetensors(str(checkpoint), shipped)
+
+    loaded, _ = load_model(tmp_path, lazy=True)
+    inputs = mx.array([[1, 2, 3]])
+    expected = loaded(inputs)
+    mx.eval(expected)
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+    # Two MoE layers behind the dense first one; 8 of 16 experts stay resident.
+    assert apply_moe_expert_offload(loaded, tmp_path, 0.5) == 2
+    actual = loaded(inputs)
+    mx.eval(actual)
+    assert mx.array_equal(expected, actual).item()
+    full = checkpoint.stat().st_size
+    assert (
+        estimate_offload_admission_bytes(tmp_path, full, 0.5)
+        == full - expert_bytes // 2
+    )
+
+
 @pytest.mark.parametrize("flat", [False, True])
 def test_qwen35_loader_paths_match_offload_admission(tmp_path, flat):
     import mlx.nn as nn
