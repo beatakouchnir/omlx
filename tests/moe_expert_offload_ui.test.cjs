@@ -59,7 +59,7 @@ vm.runInContext(fs.readFileSync(path.join(root, 'omlx/admin/static/js/dashboard.
     assert.ok(offload.includes('@click="applyMoeOffloadFit()"'));
     assert.ok(offload.includes('x-show="moeOffloadNoFit()"'));
     for (const key of ['mtp_enabled', 'vlm_mtp_enabled', 'dflash_enabled']) {
-        const scope = {modelSettings: {[enabled]:false, [key]:true}};
+        const scope = {modelSettings: {[enabled]:false, [key]:true}, selectedModel: {}};
         assert.equal(vm.runInNewContext(offload.match(/:disabled="([^"]+)"/)[1], scope), true);
         const lines = html.split('\n');
         const i = lines.findIndex(line => line.includes('@click=') && line.includes(`modelSettings.${key} = !modelSettings.${key}`));
