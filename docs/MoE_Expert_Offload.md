@@ -82,6 +82,35 @@ low residency.
 
 A call's misses are read in parallel with `os.pread` on a shared thread pool. `ensure()` schedules missing experts before the serial install loop. Slot writes, LRU updates, and hit/miss counters stay on the calling thread.
 
+### What sets decode speed
+
+A decode step costs the model's compute plus its misses: every routed expert that is not resident is read before its layer runs. Misses per token are `layers × experts per token × (1 − hit rate)`, and the hit rate is set by the residency and by how the model routes. Measured on `Qwen3.5-397B-A17B-4bit` (224 GB; 60 MoE layers of 512 experts, 10 routed per token, 7.1 MB per expert) on an M5 Max with 128 GB:
+
+| residency | footprint | decode hit rate | misses per token | step | decode tok/s |
+|---|---|---|---|---|---|
+| 40% | 87.3 GiB | 0.871 | 77 | 114 ms | 8.8 |
+| 30% | 67.5 GiB | 0.805 | 117 | 142 ms | 7.1 |
+| 20% | 47.1 GiB | 0.725 | 165 | 165 ms | 6.1 |
+| 10% | 26.8 GiB | 0.560 | 264 | 185 ms | 5.4 |
+
+One greedy request per residency through the common adapter, measured over decode tokens 64 to 320 (the first 64 warm the slots). The runs went in the order shown, one after another in the same process, without clearing the page cache between them.
+
+The cost of a miss is not constant. From 40% to 30% each added miss per token costs about 0.7 ms, close to reading 7.1 MB from the SSD. From 20% to 10% it costs about 0.2 ms: memory the slots no longer occupy becomes page cache, which serves a growing share of misses from RAM. On `OLMoE-1B-7B-0125-Instruct-4bit`, whose 3.6 GB of experts fit in the page cache entirely, a 3.5 MB miss cost 0.24 to 0.27 ms at every residency from 12.5% to 50%.
+
+The hit rate can be computed offline from the routing alone. Replaying the routed expert ids recorded in the 40% run through a per-layer LRU cache of each capacity reproduced the live decode hit rate within 0.4 points at all four residencies.
+
+The same replay bounds what a better eviction policy could gain. An optimal (Belady) cache, which knows every future request, against LRU on the same trace:
+
+| residency | LRU | optimal | difference |
+|---|---|---|---|
+| 10% | 0.558 | 0.740 | +0.18 |
+| 20% | 0.721 | 0.855 | +0.13 |
+| 30% | 0.804 | 0.907 | +0.10 |
+| 40% | 0.867 | 0.928 | +0.06 |
+| 60% | 0.921 | 0.943 | +0.02 |
+
+On OLMoE the difference was +0.12 at 12.5%, +0.20 at 25% and +0.11 at 50%. A policy that has to predict future routing gains less than these bounds, and the room is largest at low residency.
+
 ## Supported models
 
 The experimental toggle is available for `deepseek_v41`, `deepseek_v4`, `qwen4_exp`, `qwen3_5_moe` (Qwen3.5/3.6), `gemma4` MoE, `olmoe`, `glm_moe_dsa`, and `glm5_next` checkpoints whose expert tensor layout passes validation. Dense Gemma models and other model types do not show the toggle. The settings API and model loader use the same eligibility check.
